@@ -4,6 +4,8 @@ library(purrr)
 library(stringr)
 library(broom)
 
+dir.create("models", showWarnings = FALSE, recursive = TRUE)
+
 # Synthetic data generator
 generate_longitudinal_data <- function(n_individuals = 200, n_visits_range = c(2, 5), seed = 123) {
   set.seed(seed)
@@ -84,32 +86,29 @@ covars <- c("SEX", "RACE", "ETHNICITY", "AGE", "PEDIATRIC", "PROMIS_quarter_cs")
 # Utility: RMSE as predictive sigma
 rmse <- function(model) sqrt(mean(residuals(model)^2, na.rm = TRUE))
 
-# Cross-sectional (baseline PROMIS ~ reverse-coded PRO + covariates)
-fit_cs_adjusted <- function(data, measure = c("PHQ9","GAD7"), strata = NULL) {
-  measure <- match.arg(measure)
-  pro_var <- paste0(measure, "_cs")
-  # reverse-code so higher = better health
-  d <- data %>%
-    mutate(PRO_rev = max(.data[[pro_var]], na.rm = TRUE) - .data[[pro_var]])
-  
-  base_fml <- paste0("PROMIS_cs ~ PRO_rev + ", paste(covars, collapse = " + "))
-  if (!is.null(strata)) {
-    fml <- as.formula(paste0(base_fml, " + ", strata, " + PRO_rev:", strata))
-  } else {
-    fml <- as.formula(base_fml)
-  }
-  fit <- lm(fml, data = d)
-  list(fit = fit, sigma = rmse(fit))
+# helper to compute reference covariates for prediction
+covariate_reference <- function(df, covars) {
+  refs <- lapply(covars, function(v) {
+    x <- df[[v]]
+    if (is.numeric(x)) {
+      mean(x, na.rm = TRUE)
+    } else if (is.logical(x)) {
+      as.logical(round(mean(as.integer(x), na.rm = TRUE)))
+    } else {
+      # modal level
+      tab <- sort(table(x), decreasing = TRUE)
+      nm <- names(tab)[1]
+      if (is.factor(x)) factor(nm, levels = levels(x)) else nm
+    }
+  })
+  setNames(refs, covars)
 }
 
-# Longitudinal (ΔPROMIS ~ baseline PRO + ΔPRO + covariates)
-# NOTE: We DO NOT reverse-code here; instead we flip signs of coefficients on return
 fit_long_adjusted <- function(data, measure = c("PHQ9","GAD7"), strata = NULL) {
   measure <- match.arg(measure)
   base_var <- paste0(measure, "_baseline")
   dvar     <- paste0("d", measure)
   
-  # Build formula
   rhs <- c(base_var, dvar, covars)
   base_fml <- paste("dPROMIS ~", paste(rhs, collapse = " + "))
   if (!is.null(strata)) {
@@ -118,35 +117,20 @@ fit_long_adjusted <- function(data, measure = c("PHQ9","GAD7"), strata = NULL) {
     fml <- as.formula(base_fml)
   }
   fit <- lm(fml, data = data)
-  list(fit = fit, sigma = rmse(fit))
-}
-
-# Build per-program rows from a linear model
-coef_to_row <- function(fit_obj, sigma, program_label, measure, base_var, dvar) {
-  cf <- coef(fit_obj)
-  intercept  <- unname(cf["(Intercept)"])
-  b_base     <- unname(ifelse(base_var %in% names(cf), cf[base_var], 0))
-  b_change   <- unname(ifelse(dvar     %in% names(cf), cf[dvar],     0))
   
-  # Flip signs so that negative b_change => ΔPRO<0 (improvement) -> ΔPROMIS>0
-  tibble::tibble(
-    program    = program_label,
-    measure    = measure,
-    intercept  = intercept,
-    b_baseline = +b_base,   # baseline PRO as-is (higher worse => usually positive; keep as fitted)
-    b_change   = -b_change, # sign-flip for the app convention
-    sigma      = sigma
+  list(
+    fit    = fit,
+    sigma  = rmse(fit),
+    base_var = base_var,
+    dvar     = dvar,
+    cov_ref  = covariate_reference(data, covars)
   )
 }
 
-# Fit and assemble model_store
-make_model_store <- function(cs_data, long_data,
-                             stratify = c("overall","type","group"),
-                             measures = c("PHQ-9","GAD-7")) {
+make_model_registry <- function(cs_data, long_data,
+                                stratify = c("overall","type","group"),
+                                measures = c("PHQ-9","GAD-7")) {
   stratify <- match.arg(stratify)
-  out <- list()
-  
-  # determine groups/program labels
   groups <- switch(
     stratify,
     overall = "Overall",
@@ -154,6 +138,7 @@ make_model_store <- function(cs_data, long_data,
     group   = sort(unique(long_data$SVC_DEPT_GROUP))
   )
   
+  out <- list()
   for (grp in groups) {
     cs_df_use   <- cs_data
     long_df_use <- long_data
@@ -167,40 +152,32 @@ make_model_store <- function(cs_data, long_data,
     }
     
     for (m in measures) {
-      # cross-sectional (adjusted) — not needed by the app, but returned invisibly if you want to inspect
-      cs_fit <- fit_cs_adjusted(cs_df_use, measure = ifelse(m == "PHQ-9","PHQ9","GAD7"),
-                                strata = NULL)
-      # longitudinal (adjusted) — the one your app consumes
       long_fit <- fit_long_adjusted(
         long_df_use,
         measure = ifelse(m == "PHQ-9","PHQ9","GAD7"),
-        strata = NULL
+        strata  = NULL
       )
-      base_var <- paste0(ifelse(m=="PHQ-9","PHQ9","GAD7"), "_baseline")
-      dvar     <- paste0("d", ifelse(m=="PHQ-9","PHQ9","GAD7"))
       
-      row <- coef_to_row(
-        fit_obj = long_fit$fit,
-        sigma   = long_fit$sigma,
-        program_label = lbl,
-        measure = m,
-        base_var = base_var,
-        dvar     = dvar
+      out[[length(out)+1]] <- tibble::tibble(
+        program  = lbl,
+        measure  = m,
+        model    = list(long_fit$fit),
+        sigma    = long_fit$sigma,
+        base_var = long_fit$base_var,
+        dvar     = long_fit$dvar,
+        cov_ref  = list(long_fit$cov_ref)
       )
-      out[[length(out) + 1]] <- row
     }
   }
-  dplyr::bind_rows(out)
+  bind_rows(out)
 }
 
-# Build three flavors (choose one for your app)
-model_store_overall <- make_model_store(cs_df, long_df, stratify = "overall")
-model_store_type    <- make_model_store(cs_df, long_df, stratify = "type")
-model_store_group   <- make_model_store(cs_df, long_df, stratify = "group")
+# create registries (you can keep all three if useful)
+model_registry_overall <- make_model_registry(cs_df, long_df, stratify = "overall")
+model_registry_type    <- make_model_registry(cs_df, long_df, stratify = "type")
+model_registry_group   <- make_model_registry(cs_df, long_df, stratify = "group")
 
-# Example: use type-level models in your app
-model_store <- model_store_type %>%
-  rename(program = program) %>%
-  arrange(program, measure)
-
-model_store
+# choose which one your app will use by default; save all for flexibility
+saveRDS(model_registry_overall, file = "models/model_registry_overall.rds")
+saveRDS(model_registry_type,    file = "models/model_registry_type.rds")
+saveRDS(model_registry_group,   file = "models/model_registry_group.rds")

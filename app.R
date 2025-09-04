@@ -29,44 +29,47 @@ library(purrr)
 library(stringr)
 library(glue)
 
-# --------------------------------------------------------
-# 1) Example model registry (REPLACE with your real models)
-# --------------------------------------------------------
-# Each row defines a linear prediction of PROMIS change:
-#   ΔPROMIS = intercept + b_baseline * baseline + b_change * (followup - baseline)
-#   PI: yhat ± 1.96 * sigma  (simple approximation)
 
+# 1) Load models ---------------------------------------------------------------
+
+# Source the data build (creates the RDS). In production, you'd bake this step and
+# only do readRDS(); for dev this is handy.
 source("app_synthetic_inputs.R", local = TRUE)
 
-# choose which synthetic registry to expose in the app:
-model_store <- model_store_type   # or model_store_overall / model_store_group
+# Pick which registry to expose in the app:
+model_registry <- readRDS("models/model_registry_type.rds")
 
-program_choices <- sort(unique(model_store$program))
+program_choices <- sort(unique(model_registry$program))
 measure_choices <- c("Auto", "PHQ-9", "GAD-7")
 
 
-# --------------------------------------------------------
-# 2) Core prediction helper
-# --------------------------------------------------------
+# 2) Core prediction helper (now uses predict()) -------------------------------
+
 predict_promis_change <- function(program, measure, baseline, followup) {
   stopifnot(length(program) == 1, length(measure) == 1)
   if (!measure %in% c("PHQ-9", "GAD-7")) {
     stop("measure must be 'PHQ-9' or 'GAD-7'")
   }
-  row <- model_store %>% filter(program == !!program, measure == !!measure)
+  row <- model_registry %>% filter(program == !!program, measure == !!measure)
   if (nrow(row) != 1L) {
     stop(glue("No model found for program '{program}' and measure '{measure}'."))
   }
+  
   change <- followup - baseline
-  yhat <- row$intercept + row$b_baseline * baseline + row$b_change * change
-  # Simple normal-approx PI; replace with model-based PI if available
-  lo <- as.numeric(yhat - 1.96 * row$sigma)
-  hi <- as.numeric(yhat + 1.96 * row$sigma)
+  # Build newdata with required names and reference covariates
+  nd <- as.list(row$cov_ref[[1]])
+  nd[[row$base_var]] <- baseline
+  nd[[row$dvar]]     <- change
+  newdata <- as.data.frame(nd, stringsAsFactors = TRUE)
+  
+  # Let lm compute the PI properly (uses sigma & design-based variance)
+  p <- predict(row$model[[1]], newdata = newdata, interval = "prediction", level = 0.95)
   list(
-    yhat = as.numeric(yhat),
-    lo = lo,
-    hi = hi,
-    change = change
+    yhat = as.numeric(p[1, "fit"]),
+    lo   = as.numeric(p[1, "lwr"]),
+    hi   = as.numeric(p[1, "upr"]),
+    change = change,
+    model_row = row
   )
 }
 
@@ -138,19 +141,17 @@ ui <- page_fillable(
   )
 )
 
-# --------------------------------------------------------
-# 4) Server
-# --------------------------------------------------------
+
+# 4) Server updates ------------------------------------------------------------
+
 server <- function(input, output, session) {
   
-  # Which measure will we actually use?
   measure_active <- reactive({
     phq_ok <- is_complete_pair(input$phq_base, input$phq_follow)
     gad_ok <- is_complete_pair(input$gad_base, input$gad_follow)
     infer_measure(input$measure_choice, phq_ok, gad_ok)
   })
   
-  # Reactive prediction
   pred <- reactive({
     req(input$program)
     m <- measure_active()
@@ -164,12 +165,10 @@ server <- function(input, output, session) {
     
     validate(
       need(isTRUE(baseline >= 0), "Baseline must be non-negative."),
-      need(isTRUE(followup >= 0), "Follow-up must be non-negative.")
+      need(isTRUE(followup >= 0), "Follow-up must be non-negative."),
+      need(any(model_registry$program == input$program & model_registry$measure == m),
+           glue("No model available for {input$program} using {m}."))
     )
-    
-    # Ensure the selected program has a model for this measure
-    validate(need(any(model_store$program == input$program & model_store$measure == m),
-                  glue("No model available for {input$program} using {m}.")))
     
     res <- predict_promis_change(input$program, m, baseline, followup)
     list(
@@ -179,21 +178,20 @@ server <- function(input, output, session) {
       change = res$change,
       yhat = res$yhat,
       lo = res$lo,
-      hi = res$hi
+      hi = res$hi,
+      model_row = res$model_row
     )
   })
   
-  # Prediction text
   output$prediction_text <- renderUI({
     p <- pred()
     HTML(glue(
-      "<h4 style='margin-top:0;'>Predicted PROMIS change: <b>{sprintf('%.1f', p$yhat)}</b></h4>\n",
-      "<div>95% PI: <b>", sprintf("%.1f to %.1f", p$lo, p$hi), "</b></div>",
-      "<div style='color:#6c757d;'>Positive values indicate improvement.</div>"
+      "<h4 style='margin-top:0;'>Predicted PROMIS change: <b>{sprintf('%.1f', p$yhat)}</b></h4>
+       <div>95% PI: <b>{sprintf('%.1f to %.1f', p$lo, p$hi)}</b></div>
+       <div style='color:#6c757d;'>Positive values indicate improvement.</div>"
     ))
   })
   
-  # Plot with point & PI
   output$pi_plot <- renderPlot({
     p <- pred()
     df <- tibble::tibble(yhat = p$yhat, lo = p$lo, hi = p$hi)
@@ -208,7 +206,6 @@ server <- function(input, output, session) {
             panel.grid.minor.x = element_blank())
   })
   
-  # Show inputs
   output$inputs_table <- renderTable({
     p <- pred()
     tibble::tibble(
@@ -220,25 +217,32 @@ server <- function(input, output, session) {
     )
   })
   
-  # Show model row used
+  # Show the actual coefficients used (from the lm object)
   output$model_table <- renderTable({
-    m <- measure_active()
-    req(m)
-    model_store %>%
-      filter(program == input$program, measure == m) %>%
-      rename(Intercept = intercept, Baseline_coef = b_baseline, Change_coef = b_change, Sigma = sigma)
+    m <- measure_active(); req(m)
+    row <- model_registry %>% filter(program == input$program, measure == m)
+    req(nrow(row) == 1)
+    co <- coef(row$model[[1]])
+    tibble::tibble(
+      Term = names(co),
+      Coefficient = unname(co)
+    )
   })
   
-  # Equation text
+  # Equation text (pulls coefficients directly; uses your selected baseline/change names)
   output$equation_text <- renderUI({
     m <- measure_active(); req(m)
-    row <- model_store %>% filter(program == input$program, measure == m)
+    row <- model_registry %>% filter(program == input$program, measure == m)
     req(nrow(row) == 1)
+    co <- coef(row$model[[1]])
+    b0 <- round(unname(co["(Intercept)"]), 3)
+    bB <- round(unname(co[row$base_var]), 3)
+    bD <- round(unname(co[row$dvar]), 3)
     HTML(glue(
-      "<div style='margin-top:10px;color:#6c757d;'>",
-      "Model: ΔPROMIS = {round(row$intercept,3)} + {round(row$b_baseline,3)}×Baseline + {round(row$b_change,3)}×(Follow-up − Baseline)",
-      "<br/>PI ≈ ŷ ± 1.96×{round(row$sigma,2)}",
-      "</div>"
+      "<div style='margin-top:10px;color:#6c757d;'>
+        Model: ΔPROMIS = {b0} + {bB}×{row$base_var} + {bD}×(Follow-up − Baseline)
+        <br/>PI computed via lm prediction interval.
+      </div>"
     ))
   })
 }
