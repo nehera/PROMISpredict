@@ -47,29 +47,34 @@ measure_choices <- c("Auto", "PHQ-9", "GAD-7")
 
 predict_promis_change <- function(program, measure, baseline, followup) {
   stopifnot(length(program) == 1, length(measure) == 1)
-  if (!measure %in% c("PHQ-9", "GAD-7")) {
-    stop("measure must be 'PHQ-9' or 'GAD-7'")
-  }
-  row <- model_registry %>% filter(program == !!program, measure == !!measure)
-  if (nrow(row) != 1L) {
-    stop(glue("No model found for program '{program}' and measure '{measure}'."))
-  }
+  if (!measure %in% c("PHQ-9", "GAD-7")) stop("measure must be 'PHQ-9' or 'GAD-7'")
+  
+  row <- model_registry %>% dplyr::filter(program == !!program, measure == !!measure)
+  if (nrow(row) != 1L) stop(glue("No model found for program '{program}' and measure '{measure}'."))
   
   change <- followup - baseline
-  # Build newdata with required names and reference covariates
+  
+  # newdata with reference covariates
   nd <- as.list(row$cov_ref[[1]])
   nd[[row$base_var]] <- baseline
   nd[[row$dvar]]     <- change
   newdata <- as.data.frame(nd, stringsAsFactors = TRUE)
   
-  # Let lm compute the PI properly (uses sigma & design-based variance)
-  p <- predict(row$model[[1]], newdata = newdata, interval = "prediction", level = 0.95)
+  # compute 80/90/95 prediction intervals
+  levels <- c(0.80, 0.90, 0.95)
+  intervals <- purrr::map_dfr(levels, function(lv) {
+    pr <- predict(row$model[[1]], newdata = newdata, interval = "prediction", level = lv)
+    tibble::tibble(level = lv, fit = pr[1,"fit"], lwr = pr[1,"lwr"], upr = pr[1,"upr"])
+  }) %>% dplyr::arrange(level)
+  
+  # keep 95% as the headline; also keep lo/hi for backward compat with your UI
   list(
-    yhat = as.numeric(p[1, "fit"]),
-    lo   = as.numeric(p[1, "lwr"]),
-    hi   = as.numeric(p[1, "upr"]),
-    change = change,
-    model_row = row
+    change     = change,
+    yhat       = intervals$fit[intervals$level == 0.95],
+    lo         = intervals$lwr[intervals$level == 0.95],
+    hi         = intervals$upr[intervals$level == 0.95],
+    intervals  = intervals,
+    model_row  = row
   )
 }
 
@@ -170,40 +175,69 @@ server <- function(input, output, session) {
     
     res <- predict_promis_change(input$program, m, baseline, followup)
     list(
-      measure = m,
-      baseline = baseline,
-      followup = followup,
-      change = res$change,
-      yhat = res$yhat,
-      lo = res$lo,
-      hi = res$hi,
+      measure   = m,
+      baseline  = baseline,
+      followup  = followup,
+      change    = res$change,
+      yhat      = res$yhat,
+      lo        = res$lo,
+      hi        = res$hi,
+      intervals = res$intervals,   # <-- add this line
       model_row = res$model_row
     )
   })
   
   output$prediction_text <- renderUI({
-    p <- pred()
+    p  <- pred()
+    iv <- p$intervals
+    fmt <- function(x) sprintf("%.1f", x)
     HTML(glue(
-      "<h4 style='margin-top:0;'>Predicted PROMIS change: <b>{sprintf('%.1f', p$yhat)}</b></h4>
-       <div>95% PI: <b>{sprintf('%.1f to %.1f', p$lo, p$hi)}</b></div>
-       <div style='color:#6c757d;'>Positive values indicate improvement.</div>"
+      "<h4 style='margin-top:0;'>Predicted PROMIS change: <b>{fmt(p$yhat)}</b></h4>
+     <div>Prediction intervals:</div>
+     <ul style='margin-top:4px;'>
+       <li>80%: <b>{fmt(iv$lwr[iv$level==0.80])} to {fmt(iv$upr[iv$level==0.80])}</b></li>
+       <li>90%: <b>{fmt(iv$lwr[iv$level==0.90])} to {fmt(iv$upr[iv$level==0.90])}</b></li>
+       <li>95%: <b>{fmt(iv$lwr[iv$level==0.95])} to {fmt(iv$upr[iv$level==0.95])}</b></li>
+     </ul>
+     <div style='color:#6c757d;'>Positive values indicate improvement.</div>"
     ))
   })
   
+  
+  # (optionally bump height in UI: plotOutput("pi_plot", height = "300px"))
   output$pi_plot <- renderPlot({
-    p <- pred()
-    df <- tibble::tibble(yhat = p$yhat, lo = p$lo, hi = p$hi)
-    ggplot(df, aes(x = yhat, y = 1)) +
-      geom_vline(xintercept = 0, linetype = "dashed", color = "red") + 
-      geom_errorbar(aes(xmin = lo, xmax = hi), width = 0.05, linewidth = 1) +
-      geom_point(size = 3) +
-      scale_y_continuous(limits = c(0.8, 1.2)) +
-      labs(y = NULL, x = "PROMIS Change", title = "Predicted Change with 95% PI") +
+    p  <- pred()
+    iv <- p$intervals %>%
+      dplyr::mutate(
+        level_lab = factor(paste0(level*100, "% PI"),
+                           levels = c("95% PI","90% PI","80% PI")) # top→bottom
+      )
+    
+    point_df <- tibble::tibble(
+      level_lab = factor("Point", levels = c("95% PI","90% PI","80% PI","Point")),
+      fit = as.numeric(p$yhat)
+    )
+    
+    ggplot() +
+      geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.6, alpha = 0.8) +
+      geom_errorbarh(
+        data = iv,
+        aes(y = level_lab, xmin = lwr, xmax = upr),
+        height = 0.20, linewidth = 1
+      ) +
+      geom_point(
+        data = point_df,
+        aes(x = fit, y = level_lab),
+        size = 3
+      ) +
+      labs(x = "Predicted ΔPROMIS (Follow-up − Baseline)", y = NULL,
+           title = "Prediction Intervals (80/90/95%)") +
       theme_minimal(base_size = 12) +
-      theme(axis.text.y = element_blank(),
-            panel.grid.major.y = element_blank(),
-            panel.grid.minor.y = element_blank())
+      theme(panel.grid.major.y = element_blank(),
+            panel.grid.minor.y = element_blank(),
+            axis.title.y = element_blank())
   })
+  
   
   output$inputs_table <- renderTable({
     p <- pred()
