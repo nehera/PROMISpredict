@@ -88,9 +88,7 @@ is_complete_pair <- function(baseline, followup) {
   is.finite(baseline) && is.finite(followup)
 }
 
-# --------------------------------------------------------
-# 3) UI
-# --------------------------------------------------------
+# 3) UI ------------------------------------------------------------
 ui <- page_fillable(
   theme = bs_theme(version = 5, bootswatch = "flatly"),
   title = "PROMIS Change Predictor",
@@ -195,15 +193,16 @@ server <- function(input, output, session) {
   output$pi_plot <- renderPlot({
     p <- pred()
     df <- tibble::tibble(yhat = p$yhat, lo = p$lo, hi = p$hi)
-    ggplot(df, aes(x = 1, y = yhat)) +
-      geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.05, linewidth = 1) +
+    ggplot(df, aes(x = yhat, y = 1)) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "red") + 
+      geom_errorbar(aes(xmin = lo, xmax = hi), width = 0.05, linewidth = 1) +
       geom_point(size = 3) +
-      scale_x_continuous(limits = c(0.8, 1.2)) +
-      labs(x = NULL, y = "PROMIS Change", title = "Predicted Change with 95% PI") +
+      scale_y_continuous(limits = c(0.8, 1.2)) +
+      labs(y = NULL, x = "PROMIS Change", title = "Predicted Change with 95% PI") +
       theme_minimal(base_size = 12) +
-      theme(axis.text.x = element_blank(),
-            panel.grid.major.x = element_blank(),
-            panel.grid.minor.x = element_blank())
+      theme(axis.text.y = element_blank(),
+            panel.grid.major.y = element_blank(),
+            panel.grid.minor.y = element_blank())
   })
   
   output$inputs_table <- renderTable({
