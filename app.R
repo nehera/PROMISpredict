@@ -34,10 +34,10 @@ library(glue)
 
 # Source the data build (creates the RDS). In production, you'd bake this step and
 # only do readRDS(); for dev this is handy.
-source("app_synthetic_inputs.R", local = TRUE)
+# source("app_synthetic_inputs.R", local = TRUE)
 
 # Pick which registry to expose in the app:
-model_registry <- readRDS("models/model_registry_type.rds")
+model_registry <- readRDS("models/model_registry_group.rds")
 
 program_choices <- sort(unique(model_registry$program))
 measure_choices <- c("Auto", "PHQ-9", "GAD-7")
